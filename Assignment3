@@ -1,0 +1,590 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+import plotly.figure_factory as ff
+import plotly.graph_objects as go
+from IPython.display import display
+from PIL import Image
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import f1_score, roc_curve, auc
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.regularizers import l2
+from kerastuner.tuners import BayesianOptimization
+from pandarallel import pandarallel
+
+from tensorflow.keras.layers import LeakyReLU
+from tensorflow.keras.regularizers import l2
+
+pandarallel.initialize()
+
+def initialize_paths():
+    
+    """
+    this function gets all paths to use in this study.
+    """
+
+    base_path = r"/Users/Hanoriega/Downloads/histopathologic-cancer-detection/train"
+    csv_path = r"/Users/Hanoriega/Downloads/histopathologic-cancer-detection/train_labels.csv"
+    base_path_test = r"/Users/Hanoriega/Downloads/histopathologic-cancer-detection/test"
+    path = r"/Users/Hanoriega/Downloads/histopathologic-cancer-detection/train/0a0ce1220f56a48bf14615f80bc4c684244c909d.tif"
+    output_directory = r"/Users/Hanoriega/Downloads/histopathologic-cancer-detection/outputs"
+    
+    return base_path, csv_path, base_path_test, path, output_directory
+
+
+base_path, csv_path, base_path_test, path, output_directory = initialize_paths()
+
+class DataPreparation:
+    
+    def __init__(self, train_base_path: str, csv_path: str, test_base_path: str):
+        self.train_base_path = train_base_path
+        self.csv_path = csv_path
+        self.test_base_path = test_base_path
+        
+    def _make_path(self, id_str: str, base_path: str) -> str:
+        
+        """
+        generate the full file path based on the given id.
+        """
+        return os.path.join(base_path, f"{id_str}.tif")
+    
+    def prepare_train_labels(self) -> pd.DataFrame:
+        
+        """
+        prepare train labels dataframe with proper filename paths and labels.
+        """
+        df = pd.read_csv(self.csv_path)
+        df["filename"] = df["id"].apply(lambda x: self._make_path(x, self.train_base_path))
+        df["label"] = df["label"].astype(str)
+        return df
+    
+    def prepare_test_data(self) -> pd.DataFrame:
+        
+        """
+        prepare test data dataframe with proper filename paths.
+        """
+        df = pd.DataFrame()
+        df['filename'] = [os.path.join(self.test_base_path, filename) for filename in os.listdir(self.test_base_path)]
+        df["id"] = [filename[:-4] for filename in os.listdir(self.test_base_path)]
+        return df
+
+
+data_preparer = DataPreparation(base_path, csv_path, base_path_test)
+train_data = data_preparer.prepare_train_labels()
+test_data = data_preparer.prepare_test_data()
+
+def load_and_display_image(path: str):
+    
+    """
+    load an image from the provided path and display it in the Jupyter notebook.
+    """
+
+    with Image.open(path) as img:
+        img_array = np.array(img)
+        print(f"Image Shape = {img_array.shape}")
+        display(img)
+
+load_and_display_image(path)
+
+train_data.info()
+
+train_data.dtypes
+
+train_data['label'] = train_data['label'].astype(str)
+
+train_data.describe()
+
+train_data.loc[train_data.duplicated()]
+
+train_data.label.value_counts()
+
+def plot_label_distribution(train_data: pd.DataFrame) -> None:
+    
+    """
+    Plots the distribution of categories in the given training dataset.
+    """
+    
+    plot_data = train_data.groupby('label').agg(no_samples = ('id','count')).reset_index()
+    plot_data['%_labels'] = round((plot_data.no_samples/plot_data.no_samples.sum())*100,2)
+
+    fig = px.bar(plot_data, x="label", y="%_labels", 
+                 title='Distribution of categories in the training dataset', 
+                 text='%_labels')
+
+    fig.show()
+
+
+plot_label_distribution(train_data)
+
+def load_subset_images(df, label, num_images=50):
+    
+    """
+    get images of both labels (cancer/not cancer) and display it to human analysis.
+    """
+    
+    filenames = df[df['label'] == label]['filename'].head(num_images).tolist()
+    return [Image.open(filename) for filename in filenames]
+
+label_0_images = load_subset_images(train_data, '0')
+label_1_images = load_subset_images(train_data, '1')
+
+def display_side_by_side(images_0, images_1, label_0="Not Cancer", label_1="Cancer"):
+    
+    """
+    fix display to better comparison.
+    """
+    
+    total_cols = 5 
+    total_rows = max(len(images_0), len(images_1))
+    
+    fig, axs = plt.subplots(total_rows, total_cols, figsize=(15, 5*total_rows))
+    
+    for i in range(total_rows):
+        for j in range(total_cols):
+            axs[i, j].axis('off')
+            if j < 3 and i < len(images_0):  
+                axs[i, j].imshow(images_0[i])
+                axs[i, j].set_title(label_0)
+            elif j >= 3 and i < len(images_1): 
+                axs[i, j].imshow(images_1[i % 2])
+                axs[i, j].set_title(label_1)
+
+    plt.tight_layout()
+    plt.show()
+
+display_side_by_side(label_0_images, label_1_images)
+
+train_data['label'] = train_data['label'].astype(str)
+
+def create_data_generators(dataframe, test_dataframe, target_size=(96, 96), batch_size=50, validation_split=0.25):
+
+    """
+    create train, validation, and test generators from dataframes.
+
+    """
+
+    datagen = ImageDataGenerator(
+        rescale=1./255,
+        rotation_range=40,
+        width_shift_range=0.2,
+        height_shift_range=0.2,
+        shear_range=0.2,
+        zoom_range=0.2,
+        horizontal_flip=True,
+        fill_mode='nearest',
+        brightness_range=[0.7,1.3],
+        validation_split=validation_split
+    )
+    
+    data_train = datagen.flow_from_dataframe(
+        dataframe=dataframe,
+        x_col="filename",
+        y_col="label",
+        target_size=target_size,
+        color_mode="rgb",
+        batch_size=batch_size,
+        class_mode="binary",
+        subset="training",
+        validate_filenames=False
+    )
+    
+    data_val = datagen.flow_from_dataframe(
+        dataframe=dataframe,
+        x_col="filename",
+        y_col="label",
+        target_size=target_size,
+        color_mode="rgb",
+        batch_size=batch_size,
+        class_mode="binary",
+        subset="validation",
+        validate_filenames=False
+    )
+
+    data_test = ImageDataGenerator(rescale=1./255).flow_from_dataframe(
+        dataframe=test_dataframe,
+        x_col="filename",
+        target_size=target_size,
+        color_mode="rgb",
+        batch_size=batch_size,
+        class_mode=None, 
+        shuffle=False,
+        validate_filenames=False
+    )
+    
+    return data_train, data_val, data_test
+
+
+data_train, data_val, data_test = create_data_generators(train_data, test_data)
+
+Architecture Description:
+1. Baseline Model:
+Convolutional Layers: The model starts with two Conv2D layers; the first has 32 filters, followed by another with 64 filters.
+Pooling: After each Conv2D layer, a MaxPooling2D layer is applied to reduce the spatial dimensions and retain important features.
+Flattening: The output from the convolutional and pooling layers is flattened into a one-dimensional array.
+Dense Layer: The flattened data is passed through a fully connected Dense layer with 128 neurons.
+Output: A single neuron with a sigmoid activation function provides the final output.
+This baseline model was designed to establish a starting point with a simpler architecture, utilizing basic neural network concepts. It served as a reference to measure the progress and effectiveness of more complex models developed later.
+
+2. Deep Model:
+Enhanced Depth: Building on the baseline, this model includes additional Conv2D and MaxPooling2D layers to increase its depth.
+Batch Normalization: Batch normalization is incorporated to stabilize and smooth the learning process.
+Dropout: A dropout layer is introduced to prevent overfitting by randomly deactivating some neurons during training.
+3. Transfer Learning Model:
+ResNet50 Backbone: This model leverages ResNet50, a pre-trained model known for its "shortcut" connections, which help in learning deeper patterns while avoiding common pitfalls.
+Flattening: The output from ResNet50 is flattened.
+Dense Layer: The flattened data is passed through a dense layer with 128 neurons.
+Output: A single neuron with a sigmoid activation function provides the final prediction.
+ResNet50 was chosen due to its depth and prior training on large datasets, which gives it a strong starting point for recognizing complex patterns in cancer detection images. Its architecture, designed to prevent overfitting, is particularly suitable for this task. Overall, ResNet50's depth and pre-trained knowledge make it an excellent choice for tackling intricate cancer image analysis.
+
+leaky_relu = LeakyReLU(alpha=0.01)
+
+%%time
+
+def build_model(hp):
+    """
+    This snippet defines a function to build a neural network model. 
+    Depending on a choice parameter, it constructs a baseline, deep neural, or a transfer learning resnet based model.
+    The code uses Adam optimizer, and returns the configured model.
+    """
+    
+    model_choice = hp.Choice('model_type', ['baseline', 'deep', 'transfer'])
+
+    model = Sequential() 
+    
+    if model_choice == 'baseline':
+        model.add(Conv2D(32, (3,3), activation=leaky_relu, kernel_regularizer=l2(0.01), input_shape=(96, 96, 3)))
+        model.add(MaxPooling2D(2,2))
+        model.add(Conv2D(64, (3,3), activation=leaky_relu, kernel_regularizer=l2(0.01)))
+        model.add(MaxPooling2D(2,2))
+        model.add(Flatten())
+        model.add(Dense(128, activation='relu'))
+        model.add(Dense(1, activation='sigmoid'))
+        
+    
+    elif model_choice == 'deep':
+        model.add(Conv2D(32, (3,3), activation=leaky_relu, kernel_regularizer=l2(0.01), input_shape=(96, 96, 3)))
+        model.add(MaxPooling2D(2,2))
+        model.add(BatchNormalization())
+        model.add(Conv2D(64, (3,3), activation=leaky_relu))
+        model.add(MaxPooling2D(2,2))
+        model.add(BatchNormalization())
+        model.add(Conv2D(128, (3,3), activation=leaky_relu))
+        model.add(MaxPooling2D(2,2))
+        model.add(BatchNormalization())
+        model.add(Conv2D(256, (3,3), activation=leaky_relu))
+        model.add(MaxPooling2D(2,2))
+        model.add(BatchNormalization())
+        model.add(Flatten())
+        model.add(Dense(128, activation='relu'))
+        model.add(Dropout(0.5))
+        model.add(Dense(1, activation='sigmoid'))
+    
+    else:  # 'transfer'
+        base_model = EfficientNetB0(weights='imagenet', include_top=False, input_shape=(96, 96, 3))
+        model.add(base_model)
+        model.add(Flatten())
+        model.add(Dense(128, activation='relu'))
+        model.add(Dense(1, activation='sigmoid'))
+
+    model.compile(optimizer=tf.keras.optimizers.Adam(hp.Float('learning_rate', 1e-4, 1e-2, sampling='log')),
+                  loss='binary_crossentropy',
+                  metrics=['accuracy'])
+
+    return model
+
+def compute_class_weights(data_train):
+    
+    """
+    Compute class weights based on the classes of the training data.
+    """
+    
+    weights = class_weight.compute_class_weight('balanced', np.unique(data_train.classes), data_train.classes)
+    class_weights = {0: weights[0], 1: weights[1]}
+    
+    return class_weights
+
+tuner = BayesianOptimization(
+    build_model,
+    objective= 'val_accuracy',
+    max_trials= 5,
+    num_initial_points= 2,
+    directory= output_directory,
+    project_name= 'histopathologic_cancer_detection_bayesian'
+)
+
+tuner.search(data_train, epochs=10, validation_data=data_val)
+best_model = tuner.get_best_models(num_models=1)[0]
+loss, accuracy = best_model.evaluate(data_test, test_labels)
+
+print(f"Best model accuracy on test set: {accuracy:.4f}")
+
+%%time
+
+early_stopping = EarlyStopping(monitor='val_accuracy', patience=10, restore_best_weights=True)
+lr_reduction = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, verbose=1, min_lr=1e-6)
+
+tuner2 = BayesianOptimization(
+    build_model,
+    objective= 'val_accuracy',
+    max_trials= 5,
+    num_initial_points= 2,
+    directory= output_directory,
+    project_name= 'histopathologic_cancer_detection_bayesian'
+)
+
+%%time
+
+tuner2.search(data_train, epochs=10, validation_data=data_val, callbacks=[early_stopping, lr_reduction])
+best_model = tuner2.get_best_models(num_models=1)[0]
+
+%%time
+
+predictions = best_model.predict(data_test)
+
+predictions
+
+%%time
+
+def optimize_and_evaluate_model(build_model_function, 
+                                data_train, 
+                                data_val, 
+                                data_test,
+                                output_directory,
+                                max_trials=4, 
+                                epochs=6,
+                                num_initial_points=2, 
+                                project_name='histopathologic_cancer_detection_bayesian'):
+    """
+    Optimize a Keras model using Bayesian optimization and evaluate its performance.
+    """
+
+    tuner2 = BayesianOptimization(
+        build_model_function,
+        objective='val_accuracy',
+        max_trials=max_trials,
+        num_initial_points=num_initial_points,
+        directory=output_directory,
+        project_name=project_name
+    )
+
+    tuner2.search(data_train, epochs=epochs, validation_data=data_val)
+    best_model = tuner2.get_best_models(num_models=1)[0]
+    
+    val_loss, val_accuracy = best_model.evaluate(data_val)
+    print(f"Validation Accuracy: {val_accuracy*100:.2f}%")
+    print(f"Validation Loss: {val_loss:.4f}")
+
+    return best_model, val_loss, val_accuracy, tuner2
+
+best_model, val_loss, val_accuracy, tuner2 = optimize_and_evaluate_model(build_model, data_train, data_val, data_test, output_directory)
+
+%%time
+
+def evaluate_and_plot_results(model, validation_data):
+    """
+    Evaluate model on validation data and visualize the results.
+    
+    Parameters:
+    - model: Keras model.
+    - validation_data: Validation data generator.
+    
+    Returns:
+    None. (Displays plots and prints results.)
+    """
+    
+    # Predict on validation data
+    val_predictions = model.predict(validation_data)
+    binary_predictions = np.round(val_predictions).astype(int)
+    true_labels = validation_data.labels
+
+    # Create confusion matrix
+    matrix = confusion_matrix(true_labels, binary_predictions)
+    
+    # Plotly heatmap for confusion matrix
+    z = matrix.tolist()
+    x = ['Predicted 0', 'Predicted 1']
+    y = ['Actual 0', 'Actual 1']
+    fig = ff.create_annotated_heatmap(z, x=x, y=y, colorscale='Blues', showscale=False)
+    fig.update_layout(title='Confusion Matrix')
+    
+    fig.show()
+
+    # Classification report
+    report = classification_report(true_labels, binary_predictions, output_dict=True)
+    print(classification_report(true_labels, binary_predictions))
+    
+    # Plotly bar chart for classification report
+    report_data = [{'label': label, **metrics} for label, metrics in report.items() if label.isdigit()]
+    df = pd.DataFrame.from_dict(report_data)
+    
+    fig = go.Figure()
+    for metric in ['precision', 'recall', 'f1-score']:
+        fig.add_trace(go.Bar(x=df['label'], y=df[metric], name=metric))
+    fig.update_layout(title='Classification Report', 
+                      xaxis_title='Class', 
+                      yaxis_title='Score', 
+                      yaxis=dict(range=[0,1]))
+    fig.show()
+
+evaluate_and_plot_results(best_model, data_val)
+
+train_labels = np.concatenate([data_train[i][1] for i in range(len(data_train))])
+unique, counts = np.unique(train_labels, return_counts=True)
+total_samples = len(train_labels)
+n_classes = len(unique)
+class_weights = {class_label: total_samples / (n_classes * count) for class_label, count in zip(unique, counts)}
+
+true_labels = data_val.labels
+
+%%time 
+
+val_predictions = best_model.predict(data_val)
+thresholds = np.arange(0, 1.05, 0.05)
+f1_scores = [f1_score(true_labels, np.where(val_predictions > t, 1, 0)) for t in thresholds]
+optimal_threshold = thresholds[np.argmax(f1_scores)]
+
+%%time 
+
+def plot_tuner_results(tuner, data_val, val_predictions):
+    
+    """
+    Plot training and validation accuracies and losses, and the ROC curve based on a given tuner's trials.
+    """
+    
+    all_train_accuracies, all_val_accuracies, all_train_losses, all_val_losses = [], [], [], []
+
+    for trial in tuner.oracle.trials.values():
+        all_train_accuracies.append(trial.metrics.get_history('accuracy')[0].value)
+        all_val_accuracies.append(trial.metrics.get_history('val_accuracy')[0].value)
+        all_train_losses.append(trial.metrics.get_history('loss')[0].value)
+        all_val_losses.append(trial.metrics.get_history('val_loss')[0].value)
+
+    print(all_train_accuracies)
+    
+    epochs = list(range(len(all_train_accuracies)))
+
+    # Plotting Accuracies
+    
+    epochs = list(range(len(all_train_accuracies)))
+    plt.figure(figsize=(10, 5))
+    plt.plot(all_train_accuracies, label="Training Accuracies", marker='o')
+    plt.plot(all_val_accuracies, label="Validation Accuracies", marker='o')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.title('Training vs Validation Accuracies')
+    plt.legend()
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plt.show()
+
+    # Plotting Losses
+    
+    plt.figure(figsize=(10, 5))
+    plt.plot(all_train_losses, label="Training Losses", marker='o')
+    plt.plot(all_val_losses, label="Validation Losses", marker='o')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Training vs Validation Losses')
+    plt.legend()
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plt.show()
+
+
+plot_tuner_results(tuner2, data_val, val_predictions)
+
+%%time
+
+best_model.fit(data_train, epochs=2, validation_data=data_val, class_weight=class_weights, callbacks=[early_stopping, lr_reduction])
+
+evaluate_and_plot_results(best_model, data_val)
+
+%%time
+
+early_stopping = EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True)
+lr_reduction = ReduceLROnPlateau(monitor='val_accuracy', factor=0.5, patience=2, verbose=1, min_lr=1e-6)
+binary_predictions = np.where(val_predictions > optimal_threshold, 1, 0)
+
+
+tuner3 = BayesianOptimization(
+    build_model,
+    objective= 'val_accuracy',
+    max_trials= 8,
+    num_initial_points= 2,
+    directory= output_directory,
+    project_name= 'histopathologic_cancer_detection_bayesian'
+)
+
+%%time
+
+tuner3.search(data_train, epochs=10, validation_data=data_val, callbacks=[early_stopping, lr_reduction])
+best_model = tuner3.get_best_models(num_models=1)[0]
+
+%%time
+
+predictions = best_model.predict(data_test)
+
+%%time
+
+def optimize_and_evaluate_model(build_model_function, 
+                                data_train, 
+                                data_val, 
+                                data_test,
+                                output_directory,
+                                max_trials=4, 
+                                epochs=6,
+                                num_initial_points=2, 
+                                project_name='histopathologic_cancer_detection_bayesian'):
+    """
+    Optimize a Keras model using Bayesian optimization and evaluate its performance.
+    """
+
+    tuner3 = BayesianOptimization(
+        build_model_function,
+        objective='val_accuracy',
+        max_trials=max_trials,
+        num_initial_points=num_initial_points,
+        directory=output_directory,
+        project_name=project_name
+    )
+
+    tuner3.search(data_train, epochs=epochs, validation_data=data_val)
+    best_model = tuner3.get_best_models(num_models=1)[0]
+    
+    val_loss, val_accuracy = best_model.evaluate(data_val)
+    print(f"Validation Accuracy: {val_accuracy*100:.2f}%")
+    print(f"Validation Loss: {val_loss:.4f}")
+
+    return best_model, val_loss, val_accuracy, tuner3
+
+best_model, val_loss, val_accuracy, tuner3 = optimize_and_evaluate_model(build_model, data_train, data_val, data_test, output_directory)
+
+%%time 
+
+val_predictions = best_model.predict(data_val)
+thresholds = np.arange(0, 1.05, 0.05)
+f1_scores = [f1_score(true_labels, np.where(val_predictions > t, 1, 0)) for t in thresholds]
+optimal_threshold = thresholds[np.argmax(f1_scores)]
+
+%%time 
+
+plot_tuner_results(tuner3, data_val, val_predictions)
+
+%%time
+
+best_model.fit(data_train, epochs=3, validation_data=data_val, class_weight=class_weights, callbacks=[early_stopping, lr_reduction])
+
+%%time
+
+evaluate_and_plot_results(best_model, data_val)
+
